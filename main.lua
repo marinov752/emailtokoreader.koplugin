@@ -27,7 +27,7 @@ else
 end
 
 local emailtokoreader = WidgetContainer:extend{
-    name = "emailtokoreader",
+    name = "Email to KOReader",
     is_doc_only = false,
 }
 
