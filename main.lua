@@ -354,49 +354,215 @@ function emailtokoreader:showSettings()
 end
 
 function emailtokoreader:testConnection()
-    UIManager:show(InfoMessage:new{
-        text = _("Testing connection..."),
-        timeout = 1,
-    })
-    
-    UIManager:scheduleIn(0.5, function()
-        local socket_ok, socket = pcall(require, "socket")
-        if not socket_ok then
-            UIManager:show(InfoMessage:new{
-                text = _("[ERROR] LuaSocket not available"),
-                timeout = 3,
-            })
-            return
+    -- Validate configuration first
+    if not config.email or config.email == "" or config.email == "your-email@gmail.com" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] Email not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
+    if not config.password or config.password == "" or config.password == "your-app-password" or config.password == "your-app-password-here" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] Password not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
+    if not config.imap_server or config.imap_server == "" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] IMAP server not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
+    UIManager:show(
+        InfoMessage:new {
+            text = _("Testing email connection...\nThis may take a few seconds."),
+            timeout = 2
+        }
+    )
+
+    UIManager:scheduleIn(
+        0.5,
+        function()
+            local socket = require("socket")
+            if not socket then
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _("[ERROR] Socket library not available"),
+                        timeout = 4
+                    }
+                )
+                return
+            end
+
+            -- Test connection
+            local conn = socket.tcp()
+            if not conn then
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _("[ERROR] Could not create socket"),
+                        timeout = 4
+                    }
+                )
+                return
+            end
+
+            conn:settimeout(10)
+            local ok, err = conn:connect(config.imap_server, config.imap_port)
+
+            if not ok then
+                conn:close()
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _("[ERROR] Connection failed:\n" .. tostring(err)),
+                        timeout = 5
+                    }
+                )
+                return
+            end
+
+            -- SSL wrap if enabled
+            if config.use_ssl then
+                local ssl_ok, ssl = pcall(require, "ssl")
+                if ssl_ok then
+                    conn =
+                        ssl.wrap(
+                        conn,
+                        {
+                            mode = "client",
+                            protocol = "tlsv1_2",
+                            verify = "none"
+                        }
+                    )
+                    local handshake_ok, handshake_err = conn:dohandshake()
+                    if not handshake_ok then
+                        conn:close()
+                        UIManager:show(
+                            InfoMessage:new {
+                                text = _("[ERROR] SSL handshake failed:\n" .. tostring(handshake_err)),
+                                timeout = 5
+                            }
+                        )
+                        return
+                    end
+                else
+                    conn:close()
+                    UIManager:show(
+                        InfoMessage:new {
+                            text = _("[ERROR] SSL not available but use_ssl is enabled"),
+                            timeout = 4
+                        }
+                    )
+                    return
+                end
+            end
+
+            -- Read greeting
+            local greeting = conn:receive("*l")
+            if not greeting then
+                conn:close()
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _("[ERROR] No response from server"),
+                        timeout = 4
+                    }
+                )
+                return
+            end
+
+            logger.info("IMAP greeting:", greeting)
+
+            -- Try to login (this will test credentials without marking emails as read)
+            conn:send(string.format('A001 LOGIN "%s" "%s"\r\n', config.email, config.password))
+
+            local login_ok = false
+            local login_response = ""
+            for i = 1, 5 do
+                local line = conn:receive("*l")
+                if line then
+                    login_response = login_response .. line .. "\n"
+                    if line:match("^A001 OK") then
+                        login_ok = true
+                        break
+                    elseif line:match("^A001 NO") or line:match("^A001 BAD") then
+                        break
+                    end
+                end
+            end
+
+            -- Logout immediately (we don't need to do anything else)
+            conn:send("A002 LOGOUT\r\n")
+            conn:receive("*l") -- Consume response
+            conn:close()
+
+            if login_ok then
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _(
+                            "[OK] Connection successful!\n\nYour email account is properly configured and ready to use."
+                        ),
+                        timeout = 4
+                    }
+                )
+                logger.info("Connection test successful")
+            else
+                logger.warn("Login failed:", login_response)
+                UIManager:show(
+                    InfoMessage:new {
+                        text = _(
+                            "[ERROR] Login failed!\n\nPlease check your email and password.\n\nFor Gmail, make sure you're using an App Password, not your regular password."
+                        ),
+                        timeout = 6
+                    }
+                )
+            end
         end
-        
-        local conn = socket.tcp()
-        if not conn then
-            UIManager:show(InfoMessage:new{
-                text = _("[ERROR] Cannot create socket"),
-                timeout = 3,
-            })
-            return
-        end
-        
-        conn:settimeout(5)
-        local ok, err = conn:connect(config.imap_server, config.imap_port)
-        conn:close()
-        
-        if ok then
-            UIManager:show(InfoMessage:new{
-                text = _("[OK] Connection successful!"),
-                timeout = 3,
-            })
-        else
-            UIManager:show(InfoMessage:new{
-                text = _("[ERROR] Connection failed:\n" .. tostring(err)),
-                timeout = 5,
-            })
-        end
-    end)
+    )
 end
 
 function emailtokoreader:checkInbox()
+    -- Validate configuration before checking inbox
+    if not config.email or config.email == "" or config.email == "your-email@gmail.com" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] Email not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
+    if not config.password or config.password == "" or config.password == "your-app-password" or config.password == "your-app-password-here" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] Password not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
+    if not config.imap_server or config.imap_server == "" then
+        UIManager:show(
+            InfoMessage:new {
+                text = _("[ERROR] IMAP server not configured!\n\nPlease configure your settings first."),
+                timeout = 4
+            }
+        )
+        return
+    end
+
     UIManager:show(InfoMessage:new{
         text = _("Checking inbox...\nThis may take 10-20 seconds."),
         timeout = 2,
