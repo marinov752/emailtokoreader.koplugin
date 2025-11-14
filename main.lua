@@ -3,10 +3,12 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local InfoMessage = require("ui/widget/infomessage")
 local _ = require("gettext")
 local logger = require("logger")
+local DataStorage = require("datastorage")
+local lfs = require("libs/libkoreader-lfs")
 
 -- Load config
 local config_path = require("ffi/util").joinPath(
-    require("datastorage"):getDataDir(), 
+    DataStorage:getDataDir(), 
     "plugins/emailtokoreader.koplugin/config.lua"
 )
 
@@ -28,20 +30,13 @@ end
 
 -- Validate and set safe fallback path
 local function validate_and_set_download_path()
-    local ok, DataStorage = pcall(require, "datastorage")
-    if not ok then
-        logger.warn("Cannot load datastorage module, using default path")
-        return
-    end
-    
-    local ok2, lfs = pcall(require, "libs/libkoreader-lfs")
-    if not ok2 then
-        logger.warn("Cannot load lfs module, skipping path validation")
-        return
-    end
-    
     -- Get user's home directory from global reader settings as fallback
     local safe_fallback_path
+    
+    -- Preference chain for fallback path:
+    -- 1. User's home directory from G_reader_settings
+    -- 2. File manager home directory from DocSettings
+    -- 3. KOReader data directory + /downloads/
     
     -- Try to get home_dir from G_reader_settings (global settings)
     local ok_settings, G_reader_settings = pcall(require, "luasettings")
@@ -88,15 +83,15 @@ local function validate_and_set_download_path()
     
     -- Check if configured path exists and is writable
     local path_valid = false
-    if config.download_path then
+    if config.download_path and config.download_path ~= "" then
         -- Ensure path ends with /
         if not config.download_path:match("/$") then
             config.download_path = config.download_path .. "/"
         end
         
         -- Check if directory exists
-        local ok_attr, attr = pcall(lfs.attributes, config.download_path)
-        if ok_attr and attr and attr.mode == "directory" then
+        local attr = lfs.attributes(config.download_path)
+        if attr and attr.mode == "directory" then
             -- Try to create a test file to verify write permission
             local test_file = config.download_path .. ".koreader_write_test"
             local f = io.open(test_file, "w")
@@ -104,27 +99,29 @@ local function validate_and_set_download_path()
                 f:close()
                 os.remove(test_file)
                 path_valid = true
-                logger.info("Download path validated:", config.download_path)
+                logger.info("✓ Download path validated and writable:", config.download_path)
             else
-                logger.warn("Download path not writable:", config.download_path)
+                logger.warn("✗ Download path exists but not writable:", config.download_path)
             end
         else
-            logger.warn("Download path does not exist:", config.download_path)
+            logger.warn("✗ Download path does not exist or is not a directory:", config.download_path)
         end
+    else
+        logger.warn("✗ No download path configured")
     end
     
     -- Use fallback if path is invalid
-    if not path_valid then
-        logger.warn("Configured path invalid, using fallback:", safe_fallback_path)
+    if not path_valid and safe_fallback_path then
+        logger.warn("→ Switching to fallback path:", safe_fallback_path)
         
         -- Create fallback directory if it doesn't exist
-        local ok_fallback, fallback_attr = pcall(lfs.attributes, safe_fallback_path)
-        if not (ok_fallback and fallback_attr) then
-            local ok_mkdir, result = pcall(lfs.mkdir, safe_fallback_path)
-            if ok_mkdir and result then
-                logger.info("Created fallback directory:", safe_fallback_path)
+        local fallback_attr = lfs.attributes(safe_fallback_path)
+        if not fallback_attr then
+            local success, err = lfs.mkdir(safe_fallback_path)
+            if success then
+                logger.info("✓ Created fallback directory:", safe_fallback_path)
             else
-                logger.warn("Could not create fallback directory:", safe_fallback_path)
+                logger.warn("✗ Could not create fallback directory:", safe_fallback_path, "Error:", err or "unknown")
             end
         end
         
@@ -136,15 +133,50 @@ local function validate_and_set_download_path()
 end
 
 -- Validate path at startup
-local ok_validate = pcall(validate_and_set_download_path)
-if not ok_validate then
-    logger.warn("Path validation failed, using configured path as-is")
-end
+validate_and_set_download_path()
 
 local emailtokoreader = WidgetContainer:extend{
     name = "Email to KOReader",
     is_doc_only = false,
 }
+
+-- Helper function to save configuration
+local function save_config_to_file(plugin_path)
+    local config_file = plugin_path .. "/config.lua"
+    local f, err = io.open(config_file, "w")
+    if not f then
+        logger.err("✗ Failed to open config file for writing:", err or "unknown error")
+        return false, err
+    end
+    
+    -- Write config safely with proper escaping
+    local function escape_string(s)
+        if not s then return "" end
+        return s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+    end
+    
+    local success, write_err = pcall(function()
+        f:write("return {\n")
+        f:write(string.format('    email = "%s",\n', escape_string(config.email or "")))
+        f:write(string.format('    password = "%s",\n', escape_string(config.password or "")))
+        f:write(string.format('    imap_server = "%s",\n', escape_string(config.imap_server or "imap.gmail.com")))
+        f:write(string.format('    imap_port = %d,\n', config.imap_port or 993))
+        f:write(string.format('    use_ssl = %s,\n', config.use_ssl and "true" or "false"))
+        f:write(string.format('    download_path = "%s",\n', escape_string(config.download_path or "/mnt/us/Books/")))
+        f:write(string.format('    debug_mode = %s,\n', config.debug_mode and "true" or "false"))
+        f:write("}\n")
+    end)
+    
+    f:close()
+    
+    if success then
+        logger.info("✓ Settings saved to:", config_file)
+        return true
+    else
+        logger.err("✗ Failed to write config:", write_err or "unknown error")
+        return false, write_err
+    end
+end
 
 function emailtokoreader:init()
     self.ui.menu:registerToMainMenu(self)
@@ -185,27 +217,21 @@ function emailtokoreader:addToMainMenu(menu_items)
                             config.debug_mode = not config.debug_mode
                             
                             -- Save to config file
-                            local config_file = self.path .. "/config.lua"
-                            local f = io.open(config_file, "w")
-                            if f then
-                                f:write("return {\n")
-                                f:write(string.format('    email = "%s",\n', (config.email or ""):gsub('"', '\\"')))
-                                f:write(string.format('    password = "%s",\n', (config.password or ""):gsub('"', '\\"')))
-                                f:write(string.format('    imap_server = "%s",\n', (config.imap_server or "imap.gmail.com"):gsub('"', '\\"')))
-                                f:write(string.format('    imap_port = %d,\n', config.imap_port or 993))
-                                f:write(string.format('    use_ssl = %s,\n', config.use_ssl and "true" or "false"))
-                                f:write(string.format('    download_path = "%s",\n', (config.download_path or "/mnt/us/Books/"):gsub('"', '\\"')))
-                                f:write(string.format('    debug_mode = %s,\n', config.debug_mode and "true" or "false"))
-                                f:write("}\n")
-                                f:close()
-                            end
+                            local success, err = save_config_to_file(self.path)
                             
-                            UIManager:show(InfoMessage:new{
-                                text = config.debug_mode and 
-                                    _("[OK] Debug mode enabled\nWill save debug files to download folder") or
-                                    _("Debug mode disabled"),
-                                timeout = 2,
-                            })
+                            if success then
+                                UIManager:show(InfoMessage:new{
+                                    text = config.debug_mode and 
+                                        _("[OK] Debug mode enabled\nWill save debug files to download folder") or
+                                        _("[OK] Debug mode disabled"),
+                                    timeout = 2,
+                                })
+                            else
+                                UIManager:show(InfoMessage:new{
+                                    text = _("[ERROR] Failed to save debug mode setting:\n" .. (err or "unknown error")),
+                                    timeout = 4,
+                                })
+                            end
                         end,
                     },
                     {
@@ -239,8 +265,21 @@ function emailtokoreader:addToMainMenu(menu_items)
                 text = _("About"),
                 callback = function()
                     UIManager:show(InfoMessage:new{
-                        text = _("Email to KOReader v1.1.1\n\nAutomatically download EPUB files from email.\n\nFeatures:\n* Multiple files per email\n* Multiple emails support\n* Large file handling (up to 3.5MB)\n* Auto-refresh file browser\n* Debug mode\n* In-app configuration\n* Cyrillic filename support\n* Auto-transliteration\n* Safe fallback path"),
-                        timeout = 5,
+                        text = _("Email to KOReader v1.1.1\n\n" ..
+                                "Automatically download EPUB files from email.\n\n" ..
+                                "Features:\n" ..
+                                "• Multiple files per email\n" ..
+                                "• Multiple emails support\n" ..
+                                "• Large file handling (up to 3.5MB)\n" ..
+                                "• Auto-refresh file browser\n" ..
+                                "• Debug mode\n" ..
+                                "• In-app configuration validation\n" ..
+                                "• Enhanced connection testing with SSL\n" ..
+                                "• Cyrillic filename support\n" ..
+                                "• Auto-transliteration\n" ..
+                                "• Safe fallback path\n" ..
+                                "• Improved settings persistence"),
+                        timeout = 6,
                     })
                 end,
             },
@@ -304,43 +343,40 @@ function emailtokoreader:showSettings()
                     callback = function()
                         local fields = settings_dialog:getFields()
                         
+                        if not fields or #fields < 5 then
+                            logger.warn("Invalid fields returned from dialog")
+                            UIManager:show(InfoMessage:new{
+                                text = _("[ERROR] Failed to retrieve settings"),
+                                timeout = 3,
+                            })
+                            return
+                        end
+                        
                         -- Update config
-                        config.email = fields[1]
-                        config.password = fields[2]
-                        config.imap_server = fields[3]
+                        config.email = fields[1] or config.email
+                        config.password = fields[2] or config.password
+                        config.imap_server = fields[3] or config.imap_server
                         config.imap_port = tonumber(fields[4]) or 993
-                        config.download_path = fields[5]
+                        config.download_path = fields[5] or config.download_path
                         
                         -- Ensure download path ends with /
-                        if not config.download_path:match("/$") then
+                        if config.download_path and not config.download_path:match("/$") then
                             config.download_path = config.download_path .. "/"
                         end
                         
                         -- Save to config file
-                        local config_file = self.path .. "/config.lua"
-                        local f = io.open(config_file, "w")
-                        if f then
-                            f:write("return {\n")
-                            f:write(string.format('    email = "%s",\n', config.email:gsub('"', '\\"')))
-                            f:write(string.format('    password = "%s",\n', config.password:gsub('"', '\\"')))
-                            f:write(string.format('    imap_server = "%s",\n', config.imap_server:gsub('"', '\\"')))
-                            f:write(string.format('    imap_port = %d,\n', config.imap_port))
-                            f:write(string.format('    use_ssl = %s,\n', config.use_ssl and "true" or "false"))
-                            f:write(string.format('    download_path = "%s",\n', config.download_path:gsub('"', '\\"')))
-                            f:write(string.format('    debug_mode = %s,\n', config.debug_mode and "true" or "false"))
-                            f:write("}\n")
-                            f:close()
-                            
+                        local success, err = save_config_to_file(self.path)
+                        
+                        if success then
                             UIManager:close(settings_dialog)
                             UIManager:show(InfoMessage:new{
-                                text = _("[OK] Settings saved!"),
+                                text = _("[OK] Settings saved successfully!"),
                                 timeout = 2,
                             })
-                            logger.info("Settings saved to", config_file)
                         else
                             UIManager:show(InfoMessage:new{
-                                text = _("[ERROR] Failed to save settings"),
-                                timeout = 3,
+                                text = _("[ERROR] Failed to save settings:\n" .. (err or "unknown error")),
+                                timeout = 4,
                             })
                         end
                     end,
@@ -564,7 +600,7 @@ function emailtokoreader:checkInbox()
     end
 
     UIManager:show(InfoMessage:new{
-        text = _("Checking inbox...\nThis may take 10-20 seconds."),
+        text = _("Checking inbox...\nThis may take 30-40 seconds."),
         timeout = 2,
     })
     
@@ -827,6 +863,10 @@ function emailtokoreader:fetchEmails()
     
     -- Safe file write using standard io
     local function writeFile(filepath, data)
+        if not filepath or not data then
+            return false, "Invalid filepath or data"
+        end
+        
         -- Write to temp file first (atomic write pattern)
         local temp_file = filepath .. ".tmp"
         
@@ -837,11 +877,32 @@ function emailtokoreader:fetchEmails()
         
         -- Write in chunks to avoid memory issues
         local chunk_size = 8192
+        local write_ok = true
+        local write_err = nil
+        
         for i = 1, #data, chunk_size do
             local chunk = data:sub(i, math.min(i + chunk_size - 1, #data))
-            f:write(chunk)
+            local ok, err = pcall(f.write, f, chunk)
+            if not ok then
+                write_ok = false
+                write_err = err
+                break
+            end
         end
+        
         f:close()
+        
+        if not write_ok then
+            os.remove(temp_file)
+            return false, "Write failed: " .. tostring(write_err)
+        end
+        
+        -- Verify temp file size matches expected
+        local attr = lfs.attributes(temp_file)
+        if not attr or attr.size ~= #data then
+            os.remove(temp_file)
+            return false, "Size verification failed"
+        end
         
         -- Atomic rename
         os.remove(filepath) -- Remove if exists
@@ -854,11 +915,8 @@ function emailtokoreader:fetchEmails()
         return true
     end
     
-    -- Check socket
-    local socket_ok, socket = pcall(require, "socket")
-    if not socket_ok then
-        return {success = false, error = "LuaSocket not available"}
-    end
+    -- Load socket module
+    local socket = require("socket")
     
     -- Connect
     local conn = socket.tcp()
@@ -908,17 +966,27 @@ function emailtokoreader:fetchEmails()
 								   
 	
     local login_ok = false
+    local login_response = ""
     for i = 1, 5 do
         local line = conn:receive("*l")
-        if line and line:match("^A001 OK") then
-            login_ok = true
-            break
+        if line then
+            login_response = login_response .. line .. "\n"
+            if line:match("^A001 OK") then
+                login_ok = true
+                break
+            elseif line:match("^A001 NO") or line:match("^A001 BAD") then
+                break
+            end
         end
     end
     
     if not login_ok then
         conn:close()
-        return {success = false, error = "Login failed"}
+        logger.warn("Login failed during inbox check:", login_response)
+        return {
+            success = false, 
+            error = "Login failed!\n\nPlease check your email and password.\n\nFor Gmail, make sure you're using an App Password, not your regular password."
+        }
     end
 	
 							
