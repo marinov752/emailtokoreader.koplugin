@@ -1,3 +1,5 @@
+local mime = require("mime")
+
 local encoding = {}
 
 function encoding.url_decode(str)
@@ -18,6 +20,10 @@ function encoding.decode_rfc2047(str)
             return data
         end
 
+        local ok, decoded = pcall(mime.unb64, data)
+        if ok and decoded then
+            return decoded
+        end
         return data
     end)
 end
