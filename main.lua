@@ -2,10 +2,12 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
+local ButtonDialog = require("ui/widget/buttondialog")
 local DownloadMgr = require("ui/downloadmgr")
 local Dispatcher = require("dispatcher")
 local NetworkMgr = require("ui/network/manager")
 local LuaSettings = require("luasettings")
+local Device = require("device")
 local lfs = require("libs/libkoreader-lfs")
 local _ = require("gettext")
 local DataStorage = require("datastorage")
@@ -26,13 +28,13 @@ else
         imap_server = "imap.gmail.com",
         imap_port = 993,
         use_ssl = true,
-        download_path = "/mnt/us/documents/"
     }
 end
 
 -- 2. Load our local modules
 local imap = require("imap")
 local attachment = require("attachment")
+local encoding = require("encoding")
 
 -- Used when neither the UI settings nor config.lua provide a value
 local DEFAULT_EXTENSIONS = {"epub"}
@@ -42,7 +44,7 @@ local MENU_EXTENSIONS = {"epub", "acsm", "pdf", "mobi", "cbz"}
 -- 3. Writing config.lua back from the settings dialog
 -- Known keys are written first in this order; any other keys follow alphabetically
 local CONFIG_KEY_ORDER = {
-    "email", "password", "imap_server", "imap_port", "use_ssl",
+    "email", "password", "imap_server", "imap_port", "use_ssl", "folder",
     "download_path", "allowed_extensions",
 }
 
@@ -148,7 +150,7 @@ local TRUE_WORDS = { ["true"] = true, yes = true, on = true, ["1"] = true }
 local FALSE_WORDS = { ["false"] = true, no = true, off = true, ["0"] = true }
 
 local plugin = WidgetContainer:extend{
-    name = "Email to KOReader",
+    name = "emailtokoreader",
     is_doc_only = false,
 }
 
@@ -172,15 +174,33 @@ function plugin:onDispatcherRegisterActions()
 end
 
 function plugin:onEmailToKOReaderCheckInbox()
-    self:checkInbox()
+    self:checkInbox(true)
     return true
 end
 
 -- Precedence for both settings: menu choice > config.lua > built-in default
+-- The default is KOReader's home folder, which exists on every device (Kindle, Kobo, PocketBook, Android)
 function plugin:getDownloadPath()
     return self.settings:readSetting("download_path")
         or config.download_path
-        or "/mnt/us/documents/"
+        or G_reader_settings:readSetting("home_dir")
+        or Device.home_dir
+        or lfs.currentdir()
+end
+
+-- When on, downloaded emails stay unread so other devices checking the same mailbox get them too.
+-- This device then remembers what it already fetched instead of relying on the read flag.
+function plugin:isLeaveUnread()
+    return self.settings:isTrue("leave_unread")
+end
+
+-- Mailbox to check; Gmail labels are mailboxes too
+function plugin:getFolder()
+    local folder = config.folder
+    if type(folder) ~= "string" or trim(folder) == "" then
+        return "INBOX"
+    end
+    return trim(folder)
 end
 
 function plugin:getAllowedExtensions()
@@ -286,6 +306,8 @@ function plugin:showSettingsDialog(touchmenu_instance)
         local imap_server = trim(fields[3])
         local port_text = trim(fields[4])
         local ssl_text = trim(fields[5]):lower()
+        local folder = trim(fields[6])
+        if folder == "" then folder = "INBOX" end
 
         if imap_server == "" then
             return show_error(_("IMAP server must not be empty."))
@@ -313,6 +335,7 @@ function plugin:showSettingsDialog(touchmenu_instance)
         new_config.imap_server = imap_server
         new_config.imap_port = imap_port
         new_config.use_ssl = use_ssl
+        new_config.folder = folder
 
         local ok, err = write_config(new_config)
         if not ok then
@@ -359,6 +382,11 @@ function plugin:showSettingsDialog(touchmenu_instance)
                 description = _("Use SSL (true / false)"),
                 text = tostring(config.use_ssl ~= false),
                 hint = "true",
+            },
+            {
+                description = _("Mail folder / Gmail label"),
+                text = self:getFolder(),
+                hint = "INBOX",
             },
         },
         buttons = {
@@ -424,79 +452,83 @@ function plugin:addToMainMenu(menu_items)
     }
 end
 
-function plugin:checkInbox()
-    if #self:getAllowedExtensions() == 0 then
-        UIManager:show(InfoMessage:new{
-            text = _("No file extensions selected."),
-            timeout = 4,
-        })
-        return
-    end
-
-    -- Offer to turn Wi-Fi on instead of failing with a DNS error later.
-    -- Returns true while still offline; we then re-enter once the device is online.
-    if NetworkMgr:willRerunWhenOnline(function() self:checkInbox() end) then
-        return
-    end
-
+local function show_info(text, timeout)
     UIManager:show(InfoMessage:new{
-        text = _("Checking inbox..."),
-        timeout = 2,
+        text = text,
+        timeout = timeout or 4,
     })
-
-    UIManager:scheduleIn(0.5, function()
-        local ok, result = pcall(function()
-            return self:run_download()
-        end)
-
-        if not ok then
-            UIManager:show(InfoMessage:new{
-                text = _("Error: ") .. tostring(result),
-                timeout = 5,
-            })
-            return
-        end
-
-        UIManager:show(InfoMessage:new{
-            text = _("Downloaded ") .. tostring(result) .. _(" book(s)"),
-            timeout = 4,
-        })
-    end)
 end
 
-function plugin:run_download()
+local function extension_set(extensions)
+    local set = {}
+    for _, ext in ipairs(extensions) do
+        local key = normalize_extension(ext)
+        if key then set[key] = true end
+    end
+    return set
+end
+
+-- Opens the mailbox, calls fn(conn, ctx) and always logs out again.
+-- ctx.new_ids:   unread emails this device has not fetched yet
+-- ctx.known_ids: unread emails already fetched while "Leave emails unread" was on
+function plugin:withMailbox(fn)
     local conn, err = imap.connect(config)
     if not conn then
-        error("Connection failed: " .. tostring(err))
+        error("Could not reach " .. tostring(config.imap_server) .. ":" .. tostring(config.imap_port)
+            .. " (" .. tostring(err) .. ").\nCheck that the device's Wi-Fi has internet access.", 0)
     end
 
-    local ok = imap.login(conn, config.email, config.password)
-    if not ok then
-        pcall(function()
-            conn:close()
-        end)
-        error("Login failed")
-    end
-
-    local download_path = self:getDownloadPath()
-    local allowed_extensions = self:getAllowedExtensions()
+    local folder = self:getFolder()
 
     local success, result = pcall(function()
-        local ids = imap.search_unseen(conn)
-        local total_downloaded = 0
-
-        local function tick_callback()
-            UIManager:forceRePaint()
+        local ok, reason = imap.login(conn, config.email, config.password)
+        if not ok then
+            error("Login failed" .. (reason and (": " .. tostring(reason)) or ""), 0)
         end
 
+        ok, reason = imap.select(conn, folder)
+        if not ok then
+            error("Cannot open mail folder \"" .. folder .. "\""
+                .. (reason and (": " .. tostring(reason)) or ""), 0)
+        end
+        -- After a successful SELECT, `reason` holds the mailbox's UIDVALIDITY
+        local mailbox_key = table.concat({
+            tostring(config.email), tostring(config.imap_server), folder, tostring(reason or 0),
+        }, "|")
+
+        local ids, search_err = imap.search_unseen(conn)
+        if not ids then
+            error("Search failed: " .. tostring(search_err), 0)
+        end
+
+        -- Only UIDs that are still unread are kept, so the list cannot grow without bound
+        local fetched = self.settings:readSetting("fetched_uids") or {}
+        local known = {}
+        for _, uid in ipairs(fetched[mailbox_key] or {}) do known[uid] = true end
+
+        local ctx = { new_ids = {}, known_ids = {} }
         for _, id in ipairs(ids) do
-            local stream_iter = imap.fetch_stream(conn, id)
-            local downloaded = attachment.process_stream(stream_iter, download_path, tick_callback,
-                allowed_extensions)
-            total_downloaded = total_downloaded + downloaded
+            table.insert(known[id] and ctx.known_ids or ctx.new_ids, id)
         end
 
-        return total_downloaded
+        local remembered = {}
+        for _, id in ipairs(ctx.known_ids) do table.insert(remembered, id) end
+        local function save()
+            fetched[mailbox_key] = #remembered > 0 and remembered or nil
+            self.settings:saveSetting("fetched_uids", fetched)
+            self.settings:flush()
+        end
+        function ctx.remember(id)
+            table.insert(remembered, id)
+            save()
+        end
+        function ctx.forget_all()
+            remembered = {}
+            save()
+        end
+        save()
+
+        return fn(conn, ctx)
     end)
 
     pcall(function()
@@ -504,10 +536,279 @@ function plugin:run_download()
     end)
 
     if not success then
-        error(result)
+        error(result, 0)
     end
 
     return result
+end
+
+-- The books in one email, found without downloading it: { { index = 1, name = "A.epub" }, ... }.
+-- index counts the attachments with an allowed extension, the same way attachment.process_stream does.
+-- Returns nil when the server's description of the email could not be read.
+function plugin:listBooks(conn, id, allowed_set)
+    local names = imap.list_attachments(conn, id)
+    if not names then return nil end
+
+    local books = {}
+    for _, raw in ipairs(names) do
+        local name = raw
+        local decode_ok, decoded = pcall(encoding.decode_rfc2047, raw)
+        if decode_ok and decoded then name = decoded end
+
+        local ext = name:match("%.([^%.]+)$")
+        if ext and allowed_set[ext:lower()] then
+            table.insert(books, { index = #books + 1, name = encoding.safe_filename(name) })
+        end
+    end
+    return books
+end
+
+-- Lists the books waiting in the mailbox, one entry per book
+function plugin:scanInbox()
+    local allowed_set = extension_set(self:getAllowedExtensions())
+
+    return self:withMailbox(function(conn, ctx)
+        local entries = {}
+        -- Not "_" as loop variable here: it would hide the translation function used below
+        for i = 1, #ctx.new_ids do
+            local id = ctx.new_ids[i]
+            local books = self:listBooks(conn, id, allowed_set)
+            if not books then
+                -- Offer the whole email rather than hiding a book the listing could not show
+                table.insert(entries, { uid = id, whole_email = true, name = _("Email with unlisted attachments") })
+            else
+                for _, book in ipairs(books) do
+                    table.insert(entries, { uid = id, index = book.index, name = book.name })
+                end
+            end
+        end
+        return { entries = entries, unread = #ctx.new_ids }
+    end)
+end
+
+-- selection: nil downloads every book; otherwise
+--   selection[uid] = { indexes = set of book positions (nil = whole email), complete = all books of that email chosen }
+-- Emails without a chosen book are not touched at all.
+function plugin:run_download(selection)
+    local download_path = self:getDownloadPath()
+    local allowed_extensions = self:getAllowedExtensions()
+    local allowed_set = extension_set(allowed_extensions)
+    local leave_unread = self:isLeaveUnread()
+
+    return self:withMailbox(function(conn, ctx)
+        local total_downloaded = 0
+        local checked = 0
+
+        local function tick_callback()
+            UIManager:forceRePaint()
+        end
+
+        -- Already on this device. With "Leave emails unread" switched off again, catch up on the read flag.
+        if not leave_unread then
+            for _, id in ipairs(ctx.known_ids) do imap.mark_seen(conn, id) end
+            ctx.forget_all()
+        end
+
+        for _, id in ipairs(ctx.new_ids) do
+            local wanted, indexes, complete = false, nil, false
+            if selection then
+                local choice = selection[id]
+                if choice then
+                    wanted, indexes, complete = true, choice.indexes, choice.complete
+                end
+            else
+                local books = self:listBooks(conn, id, allowed_set)
+                wanted = books == nil or #books > 0
+                complete = true
+            end
+
+            if wanted then
+                local stream_iter, fetch_err = imap.fetch_stream(conn, id)
+                if not stream_iter then
+                    error("Download interrupted: " .. tostring(fetch_err), 0)
+                end
+                local downloaded = attachment.process_stream(stream_iter, download_path, tick_callback,
+                    allowed_extensions, indexes)
+                total_downloaded = total_downloaded + downloaded
+                checked = checked + 1
+
+                -- Only now is the email recorded as done: one that failed halfway is offered again next time.
+                -- An email with a book that was not chosen stays unread, so that book is offered again.
+                if complete then
+                    if leave_unread then
+                        ctx.remember(id)
+                    else
+                        imap.mark_seen(conn, id)
+                    end
+                end
+            end
+        end
+
+        return { downloaded = total_downloaded, checked = checked }
+    end)
+end
+
+function plugin:startDownload(selection)
+    show_info(_("Downloading..."), 2)
+
+    UIManager:scheduleIn(0.5, function()
+        local ok, result = pcall(function()
+            return self:run_download(selection)
+        end)
+
+        if not ok then
+            return show_info(_("Error: ") .. tostring(result), 5)
+        end
+
+        if result.downloaded > 0 then
+            show_info(_("Downloaded ") .. tostring(result.downloaded) .. _(" book(s)"))
+        else
+            show_info(_("No new books in ") .. self:getFolder() .. ".\n" .. _("Check the File extensions menu."))
+        end
+    end)
+end
+
+-- The window shown before downloading: one line per book, ticked ones are downloaded,
+-- the others stay unread in the mailbox.
+function plugin:showBookDialog(entries)
+    local dialog
+    local leave_unread = self:isLeaveUnread()
+
+    local function reopen()
+        UIManager:close(dialog)
+        self:showBookDialog(entries)
+    end
+
+    local selected_count = 0
+    for _, entry in ipairs(entries) do
+        if entry.selected then selected_count = selected_count + 1 end
+    end
+
+    local buttons = {}
+    for _, entry in ipairs(entries) do
+        table.insert(buttons, {
+            {
+                text = (entry.selected and "✓ " or "     ") .. entry.name,
+                align = "left",
+                callback = function()
+                    entry.selected = not entry.selected
+                    reopen()
+                end,
+            },
+        })
+    end
+
+    if #entries > 1 then
+        local function select_all(value)
+            return function()
+                for _, entry in ipairs(entries) do entry.selected = value end
+                reopen()
+            end
+        end
+        table.insert(buttons, {
+            { text = _("Select all"), callback = select_all(true) },
+            { text = _("Select none"), callback = select_all(false) },
+        })
+    end
+
+    table.insert(buttons, {
+        {
+            text = leave_unread and _("✓ Keep downloaded emails unread")
+                or _("Keep downloaded emails unread: off"),
+            callback = function()
+                self.settings:saveSetting("leave_unread", not leave_unread)
+                self.settings:flush()
+                reopen()
+            end,
+        },
+    })
+
+    table.insert(buttons, {
+        {
+            text = _("Cancel"),
+            callback = function()
+                UIManager:close(dialog)
+            end,
+        },
+        {
+            text = _("Download") .. " (" .. selected_count .. ")",
+            enabled = selected_count > 0,
+            callback = function()
+                -- Group the ticked books by email
+                local selection, totals = {}, {}
+                for _, entry in ipairs(entries) do
+                    totals[entry.uid] = (totals[entry.uid] or 0) + 1
+                    if entry.selected then
+                        local choice = selection[entry.uid] or { count = 0 }
+                        selection[entry.uid] = choice
+                        choice.count = choice.count + 1
+                        if not entry.whole_email then
+                            choice.indexes = choice.indexes or {}
+                            choice.indexes[entry.index] = true
+                        end
+                    end
+                end
+                for uid, choice in pairs(selection) do
+                    choice.complete = choice.count == totals[uid]
+                end
+
+                UIManager:close(dialog)
+                self:startDownload(selection)
+            end,
+        },
+    })
+
+    dialog = ButtonDialog:new{
+        title = _("Tick the books to download. The others stay unread in the mailbox.") .. "\n"
+            .. _("Keep downloaded emails unread: other devices checking this mailbox get them too."),
+        buttons = buttons,
+    }
+    UIManager:show(dialog)
+end
+
+-- direct = true skips the window and downloads every book (used by the gesture / profile action)
+function plugin:checkInbox(direct)
+    if trim(config.email) == "" or (config.password or "") == "" then
+        return show_info(_("Enter your email account under Settings first."))
+    end
+
+    if #self:getAllowedExtensions() == 0 then
+        return show_info(_("No file extensions selected."))
+    end
+
+    -- Offer to turn Wi-Fi on instead of failing with a DNS error later.
+    -- Returns true while still offline; we then re-enter once the device is online.
+    if NetworkMgr:willRerunWhenOnline(function() self:checkInbox(direct) end) then
+        return
+    end
+
+    if direct then
+        return self:startDownload(nil)
+    end
+
+    show_info(_("Checking inbox..."), 2)
+
+    UIManager:scheduleIn(0.5, function()
+        local ok, scan = pcall(function()
+            return self:scanInbox()
+        end)
+
+        if not ok then
+            return show_info(_("Error: ") .. tostring(scan), 5)
+        end
+
+        if #scan.entries == 0 then
+            if scan.unread == 0 then
+                return show_info(_("No new unread emails in ") .. self:getFolder() .. ".")
+            end
+            -- Tells "nothing arrived" apart from "arrived, but the attachment type is not ticked"
+            return show_info(_("No matching attachments in ") .. tostring(scan.unread) .. _(" new email(s).")
+                .. "\n" .. _("Check the File extensions menu."))
+        end
+
+        for _, entry in ipairs(scan.entries) do entry.selected = true end
+        self:showBookDialog(scan.entries)
+    end)
 end
 
 return plugin
