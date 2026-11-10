@@ -1,13 +1,11 @@
-# Email to KOReader (Streaming Architecture Fork)
+# Email to KOReader
 
 Automatically download book attachments from your email directly to your KOReader device.
 
-> **Note on this fork:** This version features a completely rebuilt, embedded-safe streaming IMAP parser designed specifically for low-memory e-ink devices like the Kindle Paperwhite. 
+## 🚀 How it works
+The plugin talks to your mailbox over IMAP and streams attachments straight to disk, so even
+large (5MB+) EPUBs download reliably on low-memory e-ink devices such as the Kindle Paperwhite:
 
-## 🚀 The Streaming Refactor
-The original version of this plugin processed emails by loading the entire payload into memory and running heavy regex scans, which could cause watchdog freezes and crashes on 800MHz e-ink hardware when downloading large (5MB+) EPUBs. 
-
-This fork introduces a **True Streaming Architecture**:
 * **IMAP Literal Accounting:** Reads exact byte counts to prevent protocol strings from corrupting the EPUB ZIP structure.
 * **Bounded Memory Usage:** Decodes Base64 payloads directly to disk in 8KB mathematically aligned chunks.
   Attachments sent as plain text (`7bit`/`8bit`, e.g. `.acsm` files from Apple Mail) or
@@ -50,6 +48,14 @@ The **Settings** dialog shows the current values from `config.lua`:
 * **Use SSL** accepts `true`/`false` (also `yes`/`no`, `on`/`off`, `1`/`0`).
 * **Mail folder / Gmail label** is the folder that gets checked, `INBOX` by default.
 
+Invalid input shows an error and keeps the dialog open. **Save** writes the values back to
+`config.lua` and they apply immediately, no restart needed. If the file cannot be written
+(e.g. a read-only filesystem), an error is shown and the previous settings stay active.
+
+> **Note:** saving rewrites `config.lua`, so comments in that file are removed. The file lives
+> inside the plugin folder, so replacing the folder during a plugin update also replaces your
+> account settings — keep a copy or re-enter them afterwards.
+
 #### Using a dedicated folder, `+` addresses and Gmail labels
 Gmail delivers `you+books@gmail.com` and `y.ou@gmail.com` to the same inbox as `you@gmail.com`,
 so they work without any extra setup. To keep books out of your main inbox, create a Gmail filter
@@ -59,14 +65,6 @@ providers work the same way with their own folder names.
 
 Emails without a matching attachment are never downloaded or marked as read, so the plugin is safe
 to point at a normal inbox; a dedicated folder just keeps the check faster.
-
-Invalid input shows an error and keeps the dialog open. **Save** writes the values back to
-`config.lua` and they apply immediately, no restart needed. If the file cannot be written
-(e.g. a read-only filesystem), an error is shown and the previous settings stay active.
-
-> **Note:** saving rewrites `config.lua`, so comments in that file are removed. The file lives
-> inside the plugin folder, so replacing the folder during a plugin update also replaces your
-> account settings — keep a copy or re-enter them afterwards.
 
 ### Download folder and file extensions
 Both are stored in `koreader/settings/emailtokoreader.lua`, outside the plugin folder, so they
