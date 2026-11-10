@@ -10,11 +10,17 @@ local config = {
     imap_server = "imap.gmail.com",
     imap_port = 993,
     use_ssl = true,
-    
-    -- Where you want the books saved.
-    -- Only used until you pick a folder in Tools > Email to KOReader > Download folder;
-    -- that menu choice takes precedence from then on.
-    download_path = "/mnt/us/books/",
+
+    -- Mail folder to check. Gmail labels are folders too: with a Gmail filter that applies
+    -- the label "Books" to mail sent to you+books@gmail.com, set this to "Books".
+    folder = "INBOX",
+
+    -- Where you want the books saved. Left out, KOReader's home folder is used, which works
+    -- on every device. Only used until you pick a folder in
+    -- Tools > Email to KOReader > Download folder; that menu choice takes precedence from then on.
+    -- download_path = "/mnt/us/books/",        -- Kindle
+    -- download_path = "/mnt/onboard/Books/",   -- Kobo
+    -- download_path = "/mnt/ext1/Books/",      -- PocketBook
 
     -- Attachment file extensions that will be downloaded.
     -- Add further extensions here (lowercase, without the dot), e.g. "pdf", "mobi".

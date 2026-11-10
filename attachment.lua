@@ -13,7 +13,10 @@ end
 -- Reads a MIME header parameter, including RFC 2231 forms (param*=utf-8''..., param*0=/param*1*=...).
 -- The leading [;%s] keeps "name" from matching inside "filename".
 local function header_param(block, param)
-    local prefix = "[;%s]" .. param
+    -- Header and parameter names are case-insensitive
+    local prefix = "[;%s]" .. param:gsub("%a", function(c)
+        return "[" .. c:upper() .. c:lower() .. "]"
+    end)
 
     local value = block:match(prefix .. '%s*=%s*"([^"]*)"')
         or block:match(prefix .. '%s*=%s*([^%s;"]+)')
@@ -49,8 +52,11 @@ local function decode_quoted_printable(line)
     end))
 end
 
-function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_extensions)
+-- selected: optional set of positions ({[1] = true, [3] = true}) among the attachments with an
+-- allowed extension, counted in message order; nil downloads all of them.
+function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_extensions, selected)
     local state = "SEARCHING"
+    local match_index = 0
     -- Nested multiparts (e.g. text + HTML + attachment) have one boundary per level,
     -- so every boundary seen so far stays valid
     local boundaries = {}
@@ -81,37 +87,58 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
     local downloaded_count = 0
     local lines_processed = 0
 
+    -- Drops the half-written file; nothing incomplete may end up next to the real books
+    local function abort(message)
+        if out_file then
+            out_file:close()
+            out_file = nil
+        end
+        if tmp_path then os.remove(tmp_path) end
+        error(message, 0)
+    end
+
+    -- A failed write (disk full, card removed) must not pass as a finished book
+    local function write(data)
+        local ok, err = out_file:write(data)
+        if not ok then
+            abort("Could not write " .. tostring(current_filename) .. ": " .. tostring(err))
+        end
+    end
+
     local function finalize_attachment()
         if out_file then
             if chunks_len > 0 or #b64_leftover > 0 then
                 local final_string = b64_leftover .. table.concat(chunks)
-                
+
                 -- Ensure the final string is padded to a perfect multiple of 4
                 local pad = #final_string % 4
                 if pad > 0 then
                     final_string = final_string .. string.rep("=", 4 - pad)
                 end
-                
+
                 -- Wrapped the final decode in pcall
                 local decode_ok, decoded = pcall(mime.unb64, final_string)
-                if decode_ok and decoded and #decoded > 0 then 
-                    out_file:write(decoded) 
+                if decode_ok and decoded and #decoded > 0 then
+                    write(decoded)
                 end
             end
-            
-            out_file:close()
+
+            local closed, close_err = out_file:close()
             out_file = nil
-            
+            if not closed then
+                abort("Could not write " .. tostring(current_filename) .. ": " .. tostring(close_err))
+            end
+
             if tmp_path and final_path then
                 local ok, err = os.rename(tmp_path, final_path)
                 if ok then
                     downloaded_count = downloaded_count + 1
                 else
-                    os.remove(tmp_path)
+                    abort("Could not save " .. tostring(current_filename) .. ": " .. tostring(err))
                 end
             end
         end
-        
+
         header_lines = {}
         current_filename = nil
         is_quoted_printable = false
@@ -132,24 +159,34 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
 
         line = line:gsub("\r$", "")
 
-        -- 1. Catch global boundary definitions anywhere in the email
-        local new_boundary = line:match('boundary="([^"]+)"') or line:match('boundary=([^%s;]+)')
-        if new_boundary then
-            boundaries["--" .. new_boundary] = true
+        -- 1. Catch boundary definitions in headers (never inside an attachment body)
+        if state == "SEARCHING" or state == "HEADERS" then
+            local new_boundary = line:match('[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]%s*=%s*"([^"]+)"')
+                or line:match('[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]%s*=%s*([^%s;"]+)')
+            if new_boundary then
+                boundaries["--" .. new_boundary] = true
+            end
         end
 
-        -- 2. Strict RFC boundary detection
-        if line:sub(1, 2) == "--" and (boundaries[line] or boundaries[line:match("^(.-)%-%-$") or ""]) then
+        -- 2. Strict RFC boundary detection; mail servers may pad the line with trailing whitespace
+        local delimiter = line:sub(1, 2) == "--" and line:gsub("[ \t]+$", "")
+        if delimiter and (boundaries[delimiter] or boundaries[delimiter:match("^(.-)%-%-$") or ""]) then
             finalize_attachment()
             state = "HEADERS"
-        
+
         -- 3. Accumulate headers
         elseif state == "HEADERS" then
             if line ~= "" then
-                table.insert(header_lines, line)
+                -- A line starting with whitespace continues the previous header (folding)
+                local continuation = line:match("^[ \t]+(.*)$")
+                if continuation and #header_lines > 0 then
+                    header_lines[#header_lines] = header_lines[#header_lines] .. " " .. continuation
+                else
+                    table.insert(header_lines, line)
+                end
             else
-                -- Leading space so header_param's [;%s] prefix also works on the first header
-                local header_block = " " .. table.concat(header_lines, " ")
+                -- Leading newline so header_param's [;%s] prefix also works on the first header
+                local header_block = "\n" .. table.concat(header_lines, "\n")
 
                 -- 7bit/8bit/binary (and a missing header) are stored as-is
                 local transfer_encoding = (header_block:lower():match("content%-transfer%-encoding:%s*([%w%-]+)") or "7bit")
@@ -173,6 +210,14 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
                     end
                 end
 
+                -- Optional pick by position: the n-th attachment with an allowed extension
+                if fname then
+                    match_index = match_index + 1
+                    if selected and not selected[match_index] then
+                        fname = nil
+                    end
+                end
+
                 if fname then
                     current_filename = encoding.safe_filename(fname)
                     if transfer_encoding == "base64" then
@@ -183,12 +228,17 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
                     end
 
                     filesystem.mkdir_p(download_path)
-                    final_path = filesystem.unique_filepath(download_path .. "/" .. current_filename)
+                    final_path = filesystem.unique_filepath(
+                        filesystem.normalize_path(download_path) .. current_filename)
                     tmp_path = final_path .. ".tmp"
-                    
-                    out_file = io.open(tmp_path, "wb")
+
+                    local open_err
+                    out_file, open_err = io.open(tmp_path, "wb")
                     if not out_file then
-                        state = "SEARCHING"
+                        -- Silently skipping here used to look like "no books found"
+                        tmp_path = nil
+                        abort("Cannot write to the download folder " .. tostring(download_path)
+                            .. ": " .. tostring(open_err))
                     end
                 else
                     state = "SEARCHING"
@@ -197,10 +247,11 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
 
         -- 4. Stream and validate Base64 payload
         elseif state == "BODY_BASE64" then
-            local clean = line:gsub("%s+", "")
-            
-            -- Defensive check: only buffer valid Base64 characters
-            if clean ~= "" and clean:match("^[A-Za-z0-9+/=]+$") then
+            -- RFC 2045: characters outside the Base64 alphabet are ignored, the rest of the line counts.
+            -- Dropping the whole line instead would leave a hole in the file.
+            local clean = line:gsub("[^A-Za-z0-9+/=]", "")
+
+            if clean ~= "" then
                 table.insert(chunks, clean)
                 chunks_len = chunks_len + #clean
                 
@@ -217,7 +268,7 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
                         -- Wrapped the chunk decode in pcall
                         local decode_ok, decoded = pcall(mime.unb64, chunk_to_decode)
                         if decode_ok and decoded and #decoded > 0 and out_file then
-                            out_file:write(decoded)
+                            write(decoded)
                         end
                     else
                         b64_leftover = combined
@@ -238,9 +289,9 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
             end
 
             if pending_newline then
-                out_file:write("\n")
+                write("\n")
             end
-            out_file:write(line)
+            write(line)
             pending_newline = not soft_break
         end
     end
@@ -248,8 +299,13 @@ function attachment.process_stream(stream_iter, download_path, tick_cb, allowed_
     -- 6. Safe Chunk-to-Line Buffer
     local leftover_text = ""
     while true do
-        local chunk = stream_iter()
-        
+        local chunk, stream_err = stream_iter()
+
+        -- The connection broke mid-message: saving what arrived so far would produce a corrupt book
+        if not chunk and stream_err then
+            abort("Download interrupted: " .. tostring(stream_err))
+        end
+
         -- End of stream: process any trailing text
         if not chunk then
             if leftover_text ~= "" then process_line(leftover_text) end
