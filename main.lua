@@ -474,7 +474,8 @@ end
 function plugin:withMailbox(fn)
     local conn, err = imap.connect(config)
     if not conn then
-        error("Connection failed: " .. tostring(err), 0)
+        error("Could not reach " .. tostring(config.imap_server) .. ":" .. tostring(config.imap_port)
+            .. " (" .. tostring(err) .. ").\nCheck that the device's Wi-Fi has internet access.", 0)
     end
 
     local folder = self:getFolder()

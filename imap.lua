@@ -164,12 +164,39 @@ local function collect_names(part, out)
     end
 end
 
-function imap.connect(config)
-    local conn = socket.tcp()
-    conn:settimeout(30)
+-- Tries IPv4 first, then IPv6, and reports both failures. A plain socket.tcp() walks through
+-- every address itself but only returns the last error: on a network without IPv6 that is
+-- always "Network is unreachable", which hides why the IPv4 attempt really failed.
+local function open_tcp(host, port)
+    local errors = {}
+    for _, family in ipairs({ { "tcp4", "IPv4" }, { "tcp6", "IPv6" } }) do
+        local create = socket[family[1]]
+        local conn = create and create()
+        if conn then
+            conn:settimeout(15)
+            local ok, err = conn:connect(host, port)
+            if ok then return conn end
+            conn:close()
+            table.insert(errors, family[2] .. ": " .. tostring(err))
+        end
+    end
 
-    local ok, err = conn:connect(config.imap_server, config.imap_port)
-    if not ok then return nil, err end
+    -- Older LuaSocket without tcp4/tcp6
+    if #errors == 0 then
+        local conn = socket.tcp()
+        conn:settimeout(15)
+        local ok, err = conn:connect(host, port)
+        if ok then return conn end
+        conn:close()
+        return nil, tostring(err)
+    end
+    return nil, table.concat(errors, "; ")
+end
+
+function imap.connect(config)
+    local conn, err = open_tcp(config.imap_server, config.imap_port)
+    if not conn then return nil, err end
+    conn:settimeout(30)
 
     if config.use_ssl then
         local has_ssl, ssl = pcall(require, "ssl")
